@@ -1257,17 +1257,15 @@ void ClearOrgasmCounters() {
 
 void IncrementBloodyNoseCounter(RE::FormID actorFormID, const std::string& actorName, bool isPlayer, const std::string& gender) {
     std::lock_guard<std::mutex> lock(g_bloodyNoseCounterMutex);
-    
+
     for (auto& counter : g_bloodyNoseCounters) {
         if (counter.actorFormID == actorFormID) {
-            if (!counter.spellActive) {
-                counter.orgasmCount++;
-                WriteToOStimEventsLog("BloodyNose counter updated: " + actorName + " = " + std::to_string(counter.orgasmCount), __LINE__);
-            }
+            counter.orgasmCount++;
+            WriteToOStimEventsLog("BloodyNose counter updated: " + actorName + " = " + std::to_string(counter.orgasmCount) + " (Spell active: " + (counter.spellActive ? "Yes" : "No") + ")", __LINE__);
             return;
         }
     }
-    
+
     BloodyNoseCounter newCounter;
     newCounter.actorFormID = actorFormID;
     newCounter.actorName = actorName;
@@ -1275,9 +1273,9 @@ void IncrementBloodyNoseCounter(RE::FormID actorFormID, const std::string& actor
     newCounter.gender = gender;
     newCounter.orgasmCount = 1;
     newCounter.spellActive = false;
-    
+
     g_bloodyNoseCounters.push_back(newCounter);
-    
+
     WriteToOStimEventsLog("BloodyNose counter created: " + actorName + " = 1", __LINE__);
 }
 
@@ -1293,27 +1291,42 @@ void CheckBloodyNoseCounters() {
     
     auto now = std::chrono::steady_clock::now();
     
-    for (auto it = g_bloodyNoseCounters.begin(); it != g_bloodyNoseCounters.end();) {
-        if (it->spellActive) {
-            int duration = it->isPlayer ? g_config.bloodyNosePlayer.bloodyNosesTimeSeconds : g_config.bloodyNoseNPC.bloodyNosesTimeSeconds;
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - it->spellActivationTime).count();
+    for (auto& counter : g_bloodyNoseCounters) {
+        int threshold = counter.isPlayer ? g_config.bloodyNosePlayer.bloodyNosescounter : g_config.bloodyNoseNPC.bloodyNosescounter;
+        int duration = counter.isPlayer ? g_config.bloodyNosePlayer.bloodyNosesTimeSeconds : g_config.bloodyNoseNPC.bloodyNosesTimeSeconds;
+        
+        if (counter.spellActive) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - counter.spellActivationTime).count();
             
             if (elapsed >= duration) {
-                ApplySpellEffect(it->actorFormID, it->isPlayer, !it->isPlayer, SpellSystemType::BloodyNose);
+                ApplySpellEffect(counter.actorFormID, counter.isPlayer, !counter.isPlayer, SpellSystemType::BloodyNose);
                 
                 std::string systemName = GetSpellSystemName(SpellSystemType::BloodyNose);
                 std::stringstream ss;
-                ss << "[SPELL_STATE]|" << systemName << "|" << it->actorName << "|0x" << std::hex << std::uppercase << it->actorFormID 
-                   << "|" << (it->isPlayer ? "Player" : "NPC") << "|INACTIVE|" << GetCurrentTimeString();
+                ss << "[SPELL_STATE]|" << systemName << "|" << counter.actorName << "|0x" << std::hex << std::uppercase << counter.actorFormID
+                   << "|" << (counter.isPlayer ? "Player" : "NPC") << "|INACTIVE|" << GetCurrentTimeString();
                 WriteToActionsLog(ss.str(), __LINE__);
                 
-                it->spellActive = false;
-                it->orgasmCount = 0;
+                counter.spellActive = false;
                 
-                WriteToOStimEventsLog("BloodyNose spell expired and deactivated for: " + it->actorName + " (Duration: " + std::to_string(elapsed) + "s)", __LINE__);
+                WriteToOStimEventsLog("BloodyNose spell deactivated for: " + counter.actorName + " (Duration: " + std::to_string(elapsed) + "s) - Counter: " + std::to_string(counter.orgasmCount), __LINE__);
             }
         }
-        ++it;
+        
+        if (!counter.spellActive && counter.orgasmCount >= threshold) {
+            ApplySpellEffect(counter.actorFormID, counter.isPlayer, !counter.isPlayer, SpellSystemType::BloodyNose);
+            
+            counter.spellActive = true;
+            counter.spellActivationTime = now;
+            
+            std::string systemName = GetSpellSystemName(SpellSystemType::BloodyNose);
+            std::stringstream ss;
+            ss << "[SPELL_STATE]|" << systemName << "|" << counter.actorName << "|0x" << std::hex << std::uppercase << counter.actorFormID
+               << "|" << (counter.isPlayer ? "Player" : "NPC") << "|ACTIVE|" << GetCurrentTimeString();
+            WriteToActionsLog(ss.str(), __LINE__);
+            
+            WriteToOStimEventsLog("BloodyNose spell reactivated for: " + counter.actorName + " (Counter: " + std::to_string(counter.orgasmCount) + " >= Threshold: " + std::to_string(threshold) + ")", __LINE__);
+        }
     }
 }
 
@@ -1961,6 +1974,30 @@ std::string GetSpellSystemName(SpellSystemType type) {
         case SpellSystemType::BloodyNose: return "Bloody Nose";
         default: return "Unknown";
     }
+}
+
+int GetActorFactionRank(RE::Actor* actor, RE::TESFaction* faction) {
+    if (!actor || !faction) return -1;
+
+    auto* extraFactionChanges = actor->extraList.GetByType<RE::ExtraFactionChanges>();
+    if (extraFactionChanges) {
+        for (auto& change : extraFactionChanges->factionChanges) {
+            if (change.faction == faction) {
+                return change.rank;
+            }
+        }
+    }
+
+    auto* actorBase = actor->GetActorBase();
+    if (actorBase) {
+        for (auto& factionInfo : actorBase->factions) {
+            if (factionInfo.faction == faction) {
+                return factionInfo.rank;
+            }
+        }
+    }
+
+    return -1;
 }
 
 ActiveSpellEffect* FindActiveEffect(RE::FormID actorFormID, bool isNPCCast, SpellSystemType systemType) {
@@ -2829,10 +2866,12 @@ void CleanupSpellEffectsByFaction() {
                 continue;
             }
             
-            if (actor->IsInFaction(faction)) {
+            int factionRank = GetActorFactionRank(actor, faction);
+            
+            if (factionRank >= 1) {
                 actorsInFaction++;
                 
-                WriteToOStimEventsLog("Actor in " + systemName + " faction: " + actorInfo.name + " (0x" + std::to_string(actorInfo.refID) + ")", __LINE__);
+                WriteToOStimEventsLog("Actor in " + systemName + " faction: " + actorInfo.name + " (0x" + std::to_string(actorInfo.refID) + ") - Rank: " + std::to_string(factionRank), __LINE__);
                 
                 bool isPlayer = (actorInfo.refID == 0x14);
                 bool isNPCCast = !isPlayer;
@@ -2871,53 +2910,105 @@ void CleanupSpellEffectsByFaction() {
     WriteToOStimEventsLog("  Total failed removals: " + std::to_string(totalFailedRemovals), __LINE__);
     WriteToOStimEventsLog("========================================", __LINE__);
 }
+void CleanupTagBasedEffectsAtSceneStart() {
+    WriteToOStimEventsLog("========================================", __LINE__);
+    WriteToOStimEventsLog("SCENE START CLEANUP - TAG-BASED EFFECTS", __LINE__);
+    
+    int totalActorsChecked = 0;
+    int totalActorsInFactions = 0;
+    int totalSuccessfulRemovals = 0;
+    
+    std::vector<SpellSystemType> systemsToCheck = {
+        SpellSystemType::EmotionalTears,
+        SpellSystemType::VampireTears,
+        SpellSystemType::BloodyNose
+    };
+    
+    for (const auto& systemType : systemsToCheck) {
+        std::string systemName = GetSpellSystemName(systemType);
+        
+        RE::FormID factionID = GetCachedFactionFormID(systemType);
+        
+        if (factionID == 0) {
+            WriteToOStimEventsLog("Skipping " + systemName + " - Faction not cached", __LINE__);
+            continue;
+        }
+        
+        auto* faction = RE::TESForm::LookupByID<RE::TESFaction>(factionID);
+        
+        if (!faction) {
+            WriteToOStimEventsLog("Skipping " + systemName + " - Faction not found", __LINE__);
+            continue;
+        }
+        
+        WriteToOStimEventsLog("Checking " + systemName + " faction: " + std::string(faction->GetName()), __LINE__);
+        
+        int actorsInFaction = 0;
+        int successfulRemovals = 0;
+        
+        for (const auto& actorInfo : g_sceneActors) {
+            totalActorsChecked++;
+
+            auto* actor = RE::TESForm::LookupByID<RE::Actor>(actorInfo.refID);
+            if (!actor) {
+                continue;
+            }
+
+            int factionRank = GetActorFactionRank(actor, faction);
+
+            if (factionRank >= 1) {
+                actorsInFaction++;
+                totalActorsInFactions++;
+
+                WriteToOStimEventsLog("Residual tag-based effect found: " + actorInfo.name + " in " + systemName + " faction (Rank: " + std::to_string(factionRank) + ")", __LINE__);
+
+                bool isPlayer = (actorInfo.refID == 0x14);
+                bool isNPCCast = !isPlayer;
+
+                ApplySpellEffect(actorInfo.refID, isPlayer, isNPCCast, systemType);
+
+                std::stringstream ss;
+                ss << "[SPELL_CLEANUP_START]|" << systemName << "|" << actorInfo.name << "|0x" << std::hex << std::uppercase << actorInfo.refID
+                   << "|" << (isNPCCast ? "NPC" : "Player") << "|REMOVED|" << GetCurrentTimeString();
+                WriteToActionsLog(ss.str(), __LINE__);
+
+                successfulRemovals++;
+                totalSuccessfulRemovals++;
+
+                WriteToOStimEventsLog("Cleaned " + systemName + " tag-based effect from: " + actorInfo.name, __LINE__);
+            }
+        }
+        
+        if (actorsInFaction > 0) {
+            WriteToOStimEventsLog(systemName + " cleanup: " + std::to_string(successfulRemovals) + " effects removed", __LINE__);
+        }
+    }
+    
+    WriteToOStimEventsLog("========================================", __LINE__);
+    WriteToOStimEventsLog("SCENE START CLEANUP SUMMARY:", __LINE__);
+    WriteToOStimEventsLog("  Total actors checked: " + std::to_string(totalActorsChecked), __LINE__);
+    WriteToOStimEventsLog("  Total residual effects: " + std::to_string(totalActorsInFactions), __LINE__);
+    WriteToOStimEventsLog("  Total cleaned: " + std::to_string(totalSuccessfulRemovals), __LINE__);
+    WriteToOStimEventsLog("========================================", __LINE__);
+}
+
 
 void ProcessBloodyNoseOrgasmEvent(const std::string& actorName, RE::FormID actorFormID, bool isPlayer, const std::string& gender) {
     bool bloodyNosesEnabled = isPlayer ? g_config.bloodyNosePlayer.bloodyNoses : g_config.bloodyNoseNPC.bloodyNoses;
-    
+
     if (!bloodyNosesEnabled) {
         return;
     }
-    
-    bool genderMatch = isPlayer ? 
+
+    bool genderMatch = isPlayer ?
         (gender == "Male" && g_config.bloodyNosePlayer.bloodyNosesMale) || (gender == "Female" && g_config.bloodyNosePlayer.bloodyNosesFemale) :
         (gender == "Male" && g_config.bloodyNoseNPC.bloodyNosesMale) || (gender == "Female" && g_config.bloodyNoseNPC.bloodyNosesFemale);
-    
+
     if (!genderMatch) {
         return;
     }
-    
+
     IncrementBloodyNoseCounter(actorFormID, actorName, isPlayer, gender);
-    
-    std::lock_guard<std::mutex> lock(g_bloodyNoseCounterMutex);
-    
-    for (auto& counter : g_bloodyNoseCounters) {
-        if (counter.actorFormID == actorFormID && !counter.spellActive) {
-            int requiredCount = isPlayer ? g_config.bloodyNosePlayer.bloodyNosescounter : g_config.bloodyNoseNPC.bloodyNosescounter;
-            
-            if (counter.orgasmCount >= requiredCount) {
-                WriteToOStimEventsLog("BloodyNose threshold reached for: " + actorName + " (" + std::to_string(counter.orgasmCount) + "/" + std::to_string(requiredCount) + ")", __LINE__);
-                
-                ApplySpellEffect(actorFormID, isPlayer, !isPlayer, SpellSystemType::BloodyNose);
-                
-                counter.spellActive = true;
-                counter.spellActivationTime = std::chrono::steady_clock::now();
-                
-                int duration = isPlayer ? g_config.bloodyNosePlayer.bloodyNosesTimeSeconds : g_config.bloodyNoseNPC.bloodyNosesTimeSeconds;
-                
-                WriteToOStimEventsLog("BloodyNose spell activated for: " + actorName + " (Duration: " + std::to_string(duration) + "s)", __LINE__);
-                
-                if (g_config.notification.enabled) {
-                    bool showNotif = isPlayer ? g_config.bloodyNosePlayer.showNotification : g_config.bloodyNoseNPC.showNotification;
-                    if (showNotif) {
-                        std::string msg = "ORisk-and-Reward - " + actorName + " nosebleed activated!";
-                        RE::DebugNotification(msg.c_str());
-                    }
-                }
-            }
-            break;
-        }
-    }
 }
 
 // ===== FIXED VAMPIRE TEARS SYSTEM WITH PROPER VAMPIRE DETECTION FOR ORGASM EVENTS =====
@@ -4231,23 +4322,14 @@ void ProcessNewLine(const std::string& line, const std::string& hashStr) {
         if (!IsInOStimScene()) {
             BuildNPCsCacheForScene();
             
+            ActorInfo playerInfo = CapturePlayerInfo();
+            if (playerInfo.captured) {
+                g_sceneActors.push_back(playerInfo);
+            }
+            
+            CleanupTagBasedEffectsAtSceneStart();
+            
             SetInOStimScene(true);
-            
-            bool playerExists = false;
-            for (const auto& actor : g_sceneActors) {
-                if (actor.refID == 0x14) {
-                    playerExists = true;
-                    break;
-                }
-            }
-            
-            if (!playerExists) {
-                ActorInfo playerInfo = CapturePlayerInfo();
-                if (playerInfo.captured) {
-                    g_sceneActors.push_back(playerInfo);
-                    LogActorInfo(playerInfo, true);
-                }
-            }
             
             WriteToOStimEventsLog("========================================", __LINE__);
             WriteToOStimEventsLog("SCENE START EVENT", __LINE__);
@@ -6703,7 +6785,7 @@ void InitializePlugin() {
 
         WriteToAnimationsLog("ORisk-and-Reward-NG Plugin - Starting", __LINE__);
         WriteToAnimationsLog("========================================", __LINE__);
-        WriteToAnimationsLog("ORisk-and-Reward-NG Plugin - v4.5.0", __LINE__);
+        WriteToAnimationsLog("ORisk-and-Reward-NG Plugin - v4.5.4", __LINE__);
         WriteToAnimationsLog("Started: " + GetCurrentTimeString(), __LINE__);
         WriteToAnimationsLog("========================================", __LINE__);
         WriteToAnimationsLog("Documents: " + g_documentsPath, __LINE__);
@@ -6713,14 +6795,14 @@ void InitializePlugin() {
         WriteToAnimationsLog("Plugin initialized successfully", __LINE__);
 
         WriteToActionsLog("========================================", __LINE__);
-        WriteToActionsLog("ORisk-and-Reward-NG Actions Monitor - v4.5.0", __LINE__);
+        WriteToActionsLog("ORisk-and-Reward-NG Actions Monitor - v4.5.4", __LINE__);
         WriteToActionsLog("Started: " + GetCurrentTimeString(), __LINE__);
         WriteToActionsLog("========================================", __LINE__);
         WriteToActionsLog("Configuration loaded from multi-INI system", __LINE__);
         WriteToActionsLog("Systems active: Spell Effects (3 types), Milk Events, NPC Detection, Vampire Detection, BloodyNose Counter", __LINE__);
 
         WriteToOStimEventsLog("========================================", __LINE__);
-        WriteToOStimEventsLog("ORisk-and-Reward-NG OStim Events Monitor - v4.5.0", __LINE__);
+        WriteToOStimEventsLog("ORisk-and-Reward-NG OStim Events Monitor - v4.5.4", __LINE__);
         WriteToOStimEventsLog("Started: " + GetCurrentTimeString(), __LINE__);
         WriteToOStimEventsLog("========================================", __LINE__);
         WriteToOStimEventsLog("System initialized successfully", __LINE__);
@@ -6923,7 +7005,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse) {
     SKSE::Init(a_skse);
     SetupLog();
 
-    logger::info("ORisk-and-Reward-NG Plugin v4.5.0 - Starting");
+    logger::info("ORisk-and-Reward-NG Plugin v4.5.4 - Starting");
 
     InitializePlugin();
 
@@ -6936,7 +7018,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse) {
 
 constinit auto SKSEPlugin_Version = []() {
     SKSE::PluginVersionData v;
-    v.PluginVersion({4, 5, 0});
+    v.PluginVersion({4, 5, 4});
     v.PluginName("ORisk-and-Reward-NG OStim Monitor");
     v.AuthorName("John95AC");
     v.UsesAddressLibrary();
